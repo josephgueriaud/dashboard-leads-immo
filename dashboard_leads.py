@@ -176,6 +176,16 @@ texte_brut = st.text_area(
     label_visibility="collapsed",
 )
 
+if texte_brut.strip():
+    nb_detectes = len([m for m in texte_brut.split("---") if m.strip()])
+    if nb_detectes == 1 and "---" not in texte_brut:
+        st.warning(
+            "⚠️ 1 seul message détecté. Si vous avez collé plusieurs emails, "
+            "vérifiez qu'ils sont bien séparés par une ligne contenant uniquement : ---"
+        )
+    else:
+        st.caption(f"✅ {nb_detectes} message(s) détecté(s), prêt(s) à analyser.")
+
 lancer = st.button("Analyser", type="primary", disabled=not api_key or not texte_brut.strip())
 
 if not api_key and texte_brut.strip():
