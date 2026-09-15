@@ -1,16 +1,145 @@
+import json
+import re
+import time
+
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
 st.set_page_config(page_title="Qualification de leads", page_icon="🏠", layout="wide")
 
 COULEURS_SCORE = {"chaud": "#C6E0B4", "tiède": "#FFE699", "froid": "#F4CCCC", "hors_sujet": "#D9D9D9"}
 EMOJI_SCORE = {"chaud": "🔥", "tiède": "🌤️", "froid": "❄️", "hors_sujet": "🚫"}
 
+SCHEMA_ANALYSE = {
+    "type": "object",
+    "properties": {
+        "nom_probable": {"type": ["string", "null"]},
+        "budget": {"type": ["string", "null"]},
+        "delai": {"type": ["string", "null"]},
+        "type_de_bien": {"type": ["string", "null"]},
+        "ville": {"type": ["string", "null"]},
+        "score": {"type": "string", "enum": ["chaud", "tiède", "froid", "hors_sujet"]},
+        "resume": {"type": "string"},
+        "justification": {"type": "string"},
+        "action_recommandee": {"type": "string"},
+    },
+    "required": [
+        "nom_probable", "budget", "delai", "type_de_bien", "ville",
+        "score", "resume", "justification", "action_recommandee",
+    ],
+    "additionalProperties": False,
+}
 
-@st.cache_data
-def charger_donnees(fichier):
-    df = pd.read_excel(fichier)
-    return df
+INSTRUCTIONS = """
+Tu analyses des prospects immobiliers à partir d'emails ou messages bruts.
+
+Réponds exclusivement en français standard. N'utilise aucun mot, expression
+ou caractère provenant d'une autre langue ou d'un autre alphabet, même isolé.
+
+Extrais uniquement les informations présentes dans le message.
+Ne devine jamais une information manquante : utilise null.
+Si un nom d'expéditeur est identifiable dans le message (signature, en-tête),
+extrais-le dans nom_probable, sinon laisse null.
+
+Règles de score :
+- chaud : budget connu et projet dans moins de 3 mois ;
+- tiède : projet réel, mais une information importante manque ;
+- froid : demande vague, simple information ou projet lointain ;
+- hors_sujet : le message n'est PAS une demande d'achat, de vente ou de location
+  immobilière (spam, publicité, question pratique, plainte, message vide ou
+  incompréhensible, autre langue). Ne force JAMAIS un message hors_sujet dans
+  une autre catégorie.
+
+Propose une action simple et concrète.
+"""
+
+CARACTERES_ILLEGAUX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+ALPHABET_INATTENDU = re.compile(r"[\u0400-\u04FF\u4e00-\u9fff\u0600-\u06FF]")
+ECHAPPEMENT_LITTERAL = re.compile(r"\\[nrtx]|[\\][0-9a-fA-F]{2}")
+
+MOTS_CLES_SPAM = [
+    "promo", "-50%", "-30%", "offre limitée", "cliquez ici",
+    "profitez-en", "gratuit", "sans engagement", "1xbet", "casino",
+]
+
+
+def nettoyer(texte):
+    if texte is None:
+        return texte
+    return CARACTERES_ILLEGAUX.sub("", str(texte))
+
+
+def contient_probleme(*valeurs):
+    for v in valeurs:
+        if v and (ALPHABET_INATTENDU.search(str(v)) or ECHAPPEMENT_LITTERAL.search(str(v))):
+            return True
+    return False
+
+
+def pre_filtre_local(message):
+    if not message or not message.strip():
+        return "Message vide"
+    message_normalise = message.lower()
+    if len(message.split()) <= 3 and not any(c.isdigit() for c in message):
+        return "Message trop court pour être une demande exploitable"
+    for mot_cle in MOTS_CLES_SPAM:
+        if mot_cle in message_normalise:
+            return f"Mots-clés publicitaires détectés ({mot_cle})"
+    return None
+
+
+def resultat_hors_sujet(raison):
+    return {
+        "nom_probable": None, "budget": None, "delai": None, "type_de_bien": None,
+        "ville": None, "score": "hors_sujet", "resume": raison,
+        "justification": f"Écarté automatiquement avant analyse : {raison}",
+        "action_recommandee": "Aucune action requise",
+    }
+
+
+def analyser_message(client, message, index):
+    raison_filtre = pre_filtre_local(message)
+    if raison_filtre:
+        return resultat_hors_sujet(raison_filtre), True  # True = filtré localement
+
+    for tentative in range(3):
+        try:
+            response = client.responses.create(
+                model="gpt-5.2",
+                instructions=INSTRUCTIONS,
+                input=f"Message :\n{message}",
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "analyse_lead",
+                        "strict": True,
+                        "schema": SCHEMA_ANALYSE,
+                    }
+                },
+                temperature=0.1,
+                timeout=30,
+            )
+            analyse = json.loads(response.output_text)
+            if contient_probleme(
+                analyse["resume"], analyse["action_recommandee"], analyse["justification"]
+            ):
+                if tentative < 2:
+                    continue
+                else:
+                    analyse["resume"] = nettoyer(analyse["resume"])
+            return analyse, False
+        except Exception as erreur:
+            if tentative < 2:
+                time.sleep(1.5 * (tentative + 1))
+                continue
+            return {
+                "nom_probable": None, "budget": None, "delai": None, "type_de_bien": None,
+                "ville": None, "score": "hors_sujet",
+                "resume": f"Erreur de traitement : {erreur}",
+                "justification": "Ce message n'a pas pu être analysé après plusieurs tentatives.",
+                "action_recommandee": "À traiter manuellement",
+            }, False
 
 
 def afficher_badge(score):
@@ -21,77 +150,137 @@ def afficher_badge(score):
 
 
 st.title("🏠 Qualification de leads immobiliers")
-st.caption("Tableau de bord généré automatiquement à partir des demandes reçues")
+st.caption("Collez vos demandes reçues, obtenez un tri par priorité en quelques secondes.")
 
-fichier = st.file_uploader("Charger un fichier de résultats (.xlsx)", type=["xlsx"])
-
-if fichier is None:
-    st.info("Charge le fichier resultats_leads.xlsx généré par le script pour voir le tableau de bord.")
-    st.stop()
-
-df = charger_donnees(fichier)
-
-# --- Indicateurs clés (les messages hors sujet ne comptent pas comme des leads) ---
-nb_hors_sujet = (df["Score"] == "hors_sujet").sum()
-df_leads = df[df["Score"] != "hors_sujet"]
-
-col1, col2, col3, col4 = st.columns(4)
-total = len(df_leads)
-nb_chaud = (df_leads["Score"] == "chaud").sum()
-nb_tiede = (df_leads["Score"] == "tiède").sum()
-nb_froid = (df_leads["Score"] == "froid").sum()
-
-col1.metric("Total leads", total)
-col2.metric("🔥 Chauds", nb_chaud, f"{nb_chaud / total:.0%}" if total else "0%")
-col3.metric("🌤️ Tièdes", nb_tiede, f"{nb_tiede / total:.0%}" if total else "0%")
-col4.metric("❄️ Froids", nb_froid, f"{nb_froid / total:.0%}" if total else "0%")
-
-if nb_hors_sujet:
-    st.caption(f"🚫 {nb_hors_sujet} message(s) écarté(s) automatiquement (hors sujet, spam, ou non pertinent) — non comptés ci-dessus.")
-
-st.divider()
-
-# --- Filtres ---
 with st.sidebar:
-    st.header("Filtres")
-    scores_choisis = st.multiselect(
-        "Score",
-        options=["chaud", "tiède", "froid", "hors_sujet"],
-        default=["chaud", "tiède", "froid"],
-        help="« hors_sujet » regroupe les messages écartés automatiquement (spam, non pertinent) — décoché par défaut.",
+    st.header("Configuration")
+    api_key = st.text_input(
+        "Votre clé API OpenAI",
+        type="password",
+        help="Votre clé n'est jamais enregistrée : elle n'est utilisée que le temps de cette session, "
+             "et disparaît dès que vous fermez ou rechargez la page.",
     )
-    villes_disponibles = sorted(df["Ville"].dropna().unique().tolist())
-    villes_choisies = st.multiselect("Ville", options=villes_disponibles, default=villes_disponibles)
+    st.caption("Besoin d'une clé ? platform.openai.com/api-keys")
 
-df_filtre = df[
-    df["Score"].isin(scores_choisis)
-    & (df["Ville"].isin(villes_choisies) | df["Ville"].isna())
-]
+st.subheader("1. Collez vos messages")
+st.caption('Séparez chaque email/message par une ligne contenant seulement : ---')
 
-# --- Liste des leads, triés par priorité ---
-ordre_score = {"chaud": 0, "tiède": 1, "froid": 2, "hors_sujet": 3}
-df_filtre = df_filtre.assign(_ordre=df_filtre["Score"].map(ordre_score)).sort_values("_ordre")
+texte_brut = st.text_area(
+    "Messages",
+    height=250,
+    placeholder="Bonjour, je cherche un T3 à Lyon, budget 320 000€, achat avant juin.\n"
+                "---\n"
+                "Bonjour, nous vendons notre maison, estimation souhaitée rapidement.\n"
+                "---\n"
+                "(un message par bloc, séparés par ---)",
+    label_visibility="collapsed",
+)
 
-st.subheader(f"Leads ({len(df_filtre)})")
+lancer = st.button("Analyser", type="primary", disabled=not api_key or not texte_brut.strip())
 
-for _, ligne in df_filtre.iterrows():
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown(f"**{ligne['Lead']}** — {ligne['Ville'] if pd.notna(ligne['Ville']) else 'Ville non communiquée'}")
-            st.markdown(afficher_badge(ligne["Score"]), unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"**Budget :** {ligne['Budget']}")
-            st.markdown(f"**Délai :** {ligne['Délai']}")
+if not api_key and texte_brut.strip():
+    st.warning("Entrez votre clé API OpenAI dans la barre latérale pour lancer l'analyse.")
 
-        st.write(ligne["Résumé"])
+if lancer:
+    messages = [m.strip() for m in texte_brut.split("---") if m.strip()]
+    client = OpenAI(api_key=api_key)
 
-        with st.expander("Voir le détail et l'action recommandée"):
-            st.markdown(f"**Type de bien :** {ligne['Type de bien']}")
-            st.markdown(f"**Justification du score :** {ligne['Justification']}")
-            st.markdown(f"**Action recommandée :** {ligne['Action recommandée']}")
-            if ligne.get("À relire") == "OUI":
-                st.warning("Cette ligne a été signalée pour relecture manuelle.")
+    resultats = []
+    nb_filtres_localement = 0
+    barre = st.progress(0, text=f"0/{len(messages)} messages traités")
+
+    for i, message in enumerate(messages, start=1):
+        analyse, filtre_local = analyser_message(client, message, i)
+        if filtre_local:
+            nb_filtres_localement += 1
+
+        resultats.append({
+            "Lead": nettoyer(analyse.get("nom_probable")) or f"Lead {i}",
+            "Score": nettoyer(analyse["score"]),
+            "Résumé": nettoyer(analyse["resume"]),
+            "Action recommandée": nettoyer(analyse["action_recommandee"]),
+            "Budget": nettoyer(analyse["budget"]) or "Non communiqué",
+            "Délai": nettoyer(analyse["delai"]) or "Non communiqué",
+            "Type de bien": nettoyer(analyse["type_de_bien"]) or "Non communiqué",
+            "Ville": nettoyer(analyse["ville"]) or "Non communiquée",
+            "Justification": nettoyer(analyse["justification"]),
+        })
+        barre.progress(i / len(messages), text=f"{i}/{len(messages)} messages traités")
+
+    barre.empty()
+    st.session_state["resultats"] = pd.DataFrame(resultats)
+    st.session_state["nb_filtres_localement"] = nb_filtres_localement
+
+if "resultats" in st.session_state:
+    df = st.session_state["resultats"]
+
+    st.divider()
+    st.subheader("2. Résultats")
+
+    nb_hors_sujet = (df["Score"] == "hors_sujet").sum()
+    df_leads = df[df["Score"] != "hors_sujet"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    total = len(df_leads)
+    nb_chaud = (df_leads["Score"] == "chaud").sum()
+    nb_tiede = (df_leads["Score"] == "tiède").sum()
+    nb_froid = (df_leads["Score"] == "froid").sum()
+
+    col1.metric("Total leads", total)
+    col2.metric("🔥 Chauds", nb_chaud, f"{nb_chaud / total:.0%}" if total else "0%")
+    col3.metric("🌤️ Tièdes", nb_tiede, f"{nb_tiede / total:.0%}" if total else "0%")
+    col4.metric("❄️ Froids", nb_froid, f"{nb_froid / total:.0%}" if total else "0%")
+
+    if nb_hors_sujet:
+        nb_locaux = st.session_state.get("nb_filtres_localement", 0)
+        st.caption(
+            f"🚫 {nb_hors_sujet} message(s) écarté(s) automatiquement (dont {nb_locaux} sans appel API) "
+            "— non comptés ci-dessus."
+        )
+
+    with st.sidebar:
+        st.divider()
+        st.header("Filtres")
+        scores_choisis = st.multiselect(
+            "Score", options=["chaud", "tiède", "froid", "hors_sujet"],
+            default=["chaud", "tiède", "froid"],
+        )
+        villes_disponibles = sorted(df["Ville"].dropna().unique().tolist())
+        villes_choisies = st.multiselect("Ville", options=villes_disponibles, default=villes_disponibles)
+
+    df_filtre = df[
+        df["Score"].isin(scores_choisis) & (df["Ville"].isin(villes_choisies) | df["Ville"].isna())
+    ]
+    ordre_score = {"chaud": 0, "tiède": 1, "froid": 2, "hors_sujet": 3}
+    df_filtre = df_filtre.assign(_ordre=df_filtre["Score"].map(ordre_score)).sort_values("_ordre")
+
+    st.markdown(f"**{len(df_filtre)} lead(s) affiché(s)**")
+
+    for _, ligne in df_filtre.iterrows():
+        with st.container(border=True):
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.markdown(f"**{ligne['Lead']}** — {ligne['Ville'] if pd.notna(ligne['Ville']) else 'Ville non communiquée'}")
+                st.markdown(afficher_badge(ligne["Score"]), unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"**Budget :** {ligne['Budget']}")
+                st.markdown(f"**Délai :** {ligne['Délai']}")
+            st.write(ligne["Résumé"])
+            with st.expander("Voir le détail et l'action recommandée"):
+                st.markdown(f"**Type de bien :** {ligne['Type de bien']}")
+                st.markdown(f"**Justification du score :** {ligne['Justification']}")
+                st.markdown(f"**Action recommandée :** {ligne['Action recommandée']}")
+
+    st.divider()
+    import io
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False)
+    st.download_button(
+        "📥 Télécharger le rapport complet (.xlsx)",
+        data=buffer.getvalue(),
+        file_name="resultats_leads.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 st.divider()
-st.caption("Dashboard généré automatiquement — les scores et recommandations sont produits par IA et méritent une vérification humaine sur les leads les plus prioritaires.")
+st.caption("Les scores et recommandations sont produits par IA et méritent une vérification humaine sur les leads les plus prioritaires. Votre clé API n'est jamais stockée sur nos serveurs.")
