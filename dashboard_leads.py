@@ -202,17 +202,28 @@ st.title("🏠 Qualification de leads immobiliers")
 st.caption("Collez vos demandes reçues, obtenez un tri par priorité en quelques secondes.")
 
 with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input(
-        "Votre clé API OpenAI",
+    st.header("Accès")
+    code_acces = st.text_input(
+        "Code d'accès",
         type="password",
-        help="Votre clé n'est jamais enregistrée : elle n'est utilisée que le temps de cette session, "
-             "et disparaît dès que vous fermez ou rechargez la page.",
+        help="Le code que vous avez reçu lors de la mise en place du service.",
     )
-    st.caption("Besoin d'une clé ? platform.openai.com/api-keys")
+
+codes_valides = st.secrets.get("CODES_ACCES", {})
+client_identifie = codes_valides.get(code_acces) if code_acces else None
+acces_autorise = client_identifie is not None
+
+if code_acces and not acces_autorise:
+    st.sidebar.error("Code d'accès invalide.")
+elif acces_autorise:
+    st.sidebar.success(f"Bienvenue, {client_identifie}")
 
 st.subheader("1. Collez vos messages")
-st.caption('Séparez chaque email/message par une ligne contenant seulement : ---')
+st.caption(
+    'Séparez chaque email/message par une ligne contenant seulement : --- '
+    '· Si le nom du client figure dans l\'objet du mail plutôt que dans le corps, '
+    'copiez aussi l\'objet (ex: "Objet : Demande de Marie Dupont") en première ligne du bloc.'
+)
 
 texte_brut = st.text_area(
     "Messages",
@@ -235,14 +246,14 @@ if texte_brut.strip():
     else:
         st.caption(f"✅ {nb_detectes} message(s) détecté(s), prêt(s) à analyser.")
 
-lancer = st.button("Analyser", type="primary", disabled=not api_key or not texte_brut.strip())
+lancer = st.button("Analyser", type="primary", disabled=not acces_autorise or not texte_brut.strip())
 
-if not api_key and texte_brut.strip():
-    st.warning("Entrez votre clé API OpenAI dans la barre latérale pour lancer l'analyse.")
+if not acces_autorise and texte_brut.strip():
+    st.warning("Entrez votre code d'accès dans la barre latérale pour lancer l'analyse.")
 
 if lancer:
     messages = [m.strip() for m in texte_brut.split("---") if m.strip()]
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
     resultats = []
     nb_filtres_localement = 0
@@ -339,4 +350,4 @@ if "resultats" in st.session_state:
     )
 
 st.divider()
-st.caption("Les scores et recommandations sont produits par IA et méritent une vérification humaine sur les leads les plus prioritaires. Votre clé API n'est jamais stockée sur nos serveurs.")
+st.caption("Les scores et recommandations sont produits par IA et méritent une vérification humaine sur les leads les plus prioritaires.")
