@@ -149,6 +149,55 @@ def afficher_badge(score):
     border-radius:12px; font-weight:600;">{emoji} {score}</span>"""
 
 
+def generer_excel_stylise(df):
+    """Reproduit la mise en forme du script original : en-tête colorée,
+    lignes colorées par score, colonnes ajustées, tri chaud→froid, filtres."""
+    import io
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    ordre_score = {"chaud": 0, "tiède": 1, "froid": 2, "hors_sujet": 3}
+    df_trie = df.assign(_ordre=df["Score"].map(ordre_score)).sort_values("_ordre").drop(columns="_ordre")
+
+    buffer = io.BytesIO()
+    df_trie.to_excel(buffer, index=False)
+    buffer.seek(0)
+
+    classeur = load_workbook(buffer)
+    feuille = classeur.active
+    feuille.title = "Résultats"
+
+    couleur_entete = PatternFill("solid", fgColor="1F4E78")
+    for cellule in feuille[1]:
+        cellule.font = Font(color="FFFFFF", bold=True)
+        cellule.fill = couleur_entete
+        cellule.alignment = Alignment(horizontal="center")
+
+    largeurs = {"A": 20, "B": 12, "C": 45, "D": 35, "E": 18, "F": 18, "G": 20, "H": 18, "I": 45}
+    for colonne, largeur in largeurs.items():
+        feuille.column_dimensions[colonne].width = largeur
+
+    for ligne in feuille.iter_rows(min_row=2):
+        for cellule in ligne:
+            cellule.alignment = Alignment(vertical="top", wrap_text=True)
+        score = ligne[1].value
+        if score == "chaud":
+            ligne[1].fill = PatternFill("solid", fgColor="C6E0B4")
+        elif score == "tiède":
+            ligne[1].fill = PatternFill("solid", fgColor="FFE699")
+        elif score == "froid":
+            ligne[1].fill = PatternFill("solid", fgColor="F4CCCC")
+        elif score == "hors_sujet":
+            ligne[1].fill = PatternFill("solid", fgColor="D9D9D9")
+
+    feuille.freeze_panes = "A2"
+    feuille.auto_filter.ref = feuille.dimensions
+
+    buffer_final = io.BytesIO()
+    classeur.save(buffer_final)
+    return buffer_final.getvalue()
+
+
 st.title("🏠 Qualification de leads immobiliers")
 st.caption("Collez vos demandes reçues, obtenez un tri par priorité en quelques secondes.")
 
@@ -282,12 +331,9 @@ if "resultats" in st.session_state:
                 st.markdown(f"**Action recommandée :** {ligne['Action recommandée']}")
 
     st.divider()
-    import io
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False)
     st.download_button(
         "📥 Télécharger le rapport complet (.xlsx)",
-        data=buffer.getvalue(),
+        data=generer_excel_stylise(df),
         file_name="resultats_leads.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
